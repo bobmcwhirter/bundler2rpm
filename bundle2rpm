@@ -1,0 +1,252 @@
+
+require 'rubygems'
+
+require 'pp'
+require 'bundler'
+require 'fileutils'
+
+Gem.platforms.unshift( Gem::Platform::JAVA )
+
+Bundler.settings[:path] = File.join( Dir.pwd, 'cache' )
+
+
+module Gem
+  class Requirement
+    def rpm_version_transform(version)
+      if version == "> 0.0.0"
+        version = ""
+      elsif version =~ /^~> (.+)$/
+        next_version = Gem::Version.create($1).bump.to_s
+
+        version = ["=> #$1", "< #{next_version}"]
+      end
+      version
+    end
+
+    def to_rpm
+      result = as_list
+      return result.map { |version| rpm_version_transform(version) }.flatten
+    end
+
+  end
+end
+
+
+class RubyConfig
+  attr_accessor :ruby_sitelib
+  attr_accessor :gem_dir
+  attr_accessor :bin_dir
+  attr_accessor :ruby_abi
+
+  attr_accessor :tree_prefix
+
+  def initialize()
+    @ruby_sitelib = '/opt/jruby/lib/ruby/site_ruby/1.8'
+    @gem_dir = '/opt/jruby/lib/ruby/gems/1.8'
+    @bin_dir = '/opt/jruby/bin'
+    @ruby_abi    = '1.8-java'
+    @tree_prefix = 'torquebox-'
+  end
+end
+
+class BundleConverter
+
+  attr_accessor :gemfile
+  attr_accessor :ruby_config
+  attr_accessor :definition
+
+  def initialize(gemfile, ruby_config=RubyConfig.new)
+    @gemfile = gemfile
+    @ruby_config = ruby_config
+  end
+
+  def resolve!()
+    @definition = Bundler::Definition.build( @gemfile, @gemfile + '.lock', true )
+    @definition.resolve_remotely!
+  end
+
+  def dump_specs(output_dir)
+    @definition.specs.each do |spec|
+      dump_spec( output_dir, spec )
+    end
+  end
+
+  def dump_spec(output_dir, gemspec)
+    rpmspec_path = File.join( output_dir, "#{gemspec.name}.spec" )
+    puts "Writing #{rpmspec_path}"
+    FileUtils.mkdir_p( File.dirname( rpmspec_path ) )
+    File.open( rpmspec_path, 'w' ) do |file|
+      SpecConverter.new( ruby_config, gemspec, file ).dump
+    end
+  end
+
+end
+
+class SpecConverter
+
+  attr_accessor :gemspec
+  attr_accessor :ruby_config
+
+  def initialize(ruby_config, gemspec, out)
+    @ruby_config = ruby_config
+    @gemspec = gemspec
+    @out = out
+  end
+  
+  def emit(*args)
+    puts args
+    @out.puts( args )
+  end
+
+  def gem_url()
+    if ( gemspec.platform != 'ruby' )
+      "http://rubygems.org/gems/#{gem_name}-#{version}-#{gemspec.platform}.gem"
+    else
+      "http://rubygems.org/gems/#{gem_name}-#{version}.gem"
+    end
+  end
+
+  def gem_name()
+    gemspec.name
+  end
+
+  def description()
+    @gemspec.description.to_s.chomp
+  end
+
+  def rpm_name()
+    "#{ruby_config.tree_prefix}#{gemspec.name}"
+  end
+
+  def version()
+    @gemspec.version
+  end
+
+  def summary()
+    @gemspec.summary.gsub(/\.$/, '' )
+  end
+
+  def platform()
+    @gemspec.platform
+  end
+
+  def dump()
+    dump_prolog
+  end
+
+  def dump_prolog
+    dump_global_variables
+    dump_package_summary
+    dump_provides
+    dump_requires
+
+    dump_prep
+    dump_build
+    dump_install
+    dump_clean
+
+    dump_files
+    dump_changelog
+  end
+
+  def dump_global_variables
+    emit "%global tree_prefix  #{ruby_config.tree_prefix}"
+    emit "%global ruby_sitelib #{ruby_config.ruby_sitelib}"
+    emit "%global gem_dir      #{ruby_config.gem_dir}"
+    emit "%global bin_dir      #{ruby_config.bin_dir}"
+    emit "%global gem_name     #{gem_name}"
+    emit "%global gem_instdir  %{gem_dir}/gems/%{gem_name}-%{version}"
+    emit "%global ruby_abi     #{ruby_config.ruby_abi}"
+    emit ''
+  end
+
+  def dump_package_summary
+    emit "Name: %{tree_prefix}rubygem-%{gem_name}"
+    emit "Version: #{version}"
+    emit "Release: 1%{?dist}"
+    emit "Group: Development/Languages"
+    emit "License: GPLv2+ or Ruby"
+    emit "Summary: #{summary}"
+    emit "Description: #{description}"
+
+    if (gemspec.homepage)
+      emit "URL: #{gemspec.homepage}"
+    end
+
+    emit "Source0: #{gem_url}"
+    emit ""
+  end
+
+  def dump_provides
+    emit "Provides: %{tree_prefix}rubygem(%{gem_name}) = %{version}"
+    emit ""
+  end
+
+  def dump_requires
+    emit "Requires: ruby(abi) = %{ruby_abi}"
+    emit ""
+    gemspec.dependencies.each do |dep|
+      emit "Requires: %{tree_prefix}rubygem(#{dep.name}) #{dep.requirement.to_rpm}"
+    end
+    emit ""
+  end
+
+
+  def dump_prep
+    emit "%prep"
+    emit ""
+  end
+
+  def dump_build
+    emit "%build"
+    emit ""
+  end
+
+  def dump_install
+    emit "%install"
+    emit ""
+    emit "rm -rf %{buildroot}"
+    emit "install -m 755 -d %{buildroot}%{gem_dir}"
+    emit "install -m 755 -d %{buildroot}%{bin_dir}"
+    emit "gem install --local --bindir %{bin_dir} --install-dir %{buildroot}%{gem_dir} --force --ignore-dependencies --platform #{platform}"
+    emit ""
+  end
+
+  def dump_clean
+    emit "%clean"
+    emit ""
+    emit "rm -rf %{buildroot}"
+    emit ""
+  end
+
+  def dump_files
+    emit "%files"
+    emit ""
+    emit "%defattr(-, root, root, -)"
+    for f in gemspec.executables 
+      emit "%{bin_dir}/#{f}"
+      emit "%{gem_dir}%{bin_dir}/#{f}"
+    end
+    emit "%{gem_dir}/gems/%{gem_name}-%{version}/"
+    emit "%{gem_dir}/cache/%{gemname}-%{version}.gem"
+    emit "%{gem_dir}/specifications/%{gemname}-%{version}.gemspec"
+    if gemspec.has_rdoc 
+      emit "%doc %{gemdir}/doc/%{gemname}-%{version}"
+    end
+    for f in gemspec.extra_rdoc_files
+      emit "%doc %{geminstdir}/#{f}"
+    end
+    emit ""
+  end
+
+  def dump_changelog
+    emit "%changelog"
+    emit ""
+  end
+
+end
+
+
+converter = BundleConverter.new( 'Gemfile' )
+converter.resolve!
+converter.dump_specs( 'specs' )
